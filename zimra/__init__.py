@@ -49,7 +49,6 @@ class ZimraServerError(Exception):
     
     def __init__(self, status_code, message):
         self.status_code = status_code  # Store the status code for further use
-        # Initialize the Exception base class with the error message
         super().__init__(f"ZimraServerError {status_code}: {message}")
      
 
@@ -73,23 +72,20 @@ def register_new_device(
     ):
     '''
     Parameters:
-    
-    folder_name: string (name of the prospective folder to save the certificate and file)
-    
-    fiscal_device_serial_no: string 
-    
-    device_id: string (should be 0 padded 10 digit string but confirm with Zimra first after the debacle with Kolfhurst)
-    
-    activation_key: str (should be 0 padded 8 digit string. For example: '00398834')
-    
-    certificate_filename: string (prospective file name for the certificate)
-    
-    private_key_filename: (prospective file name for the private key)
-    
-    prod: bool  (True for production, False for testing)
 
-    
-    todo: create a pfx along so that output is just sent to Mr Kashiri's system
+    folder_name: string (name of the prospective folder to save the certificate and file)
+
+    fiscal_device_serial_no: string 
+
+    device_id: string (should be 0 padded 10 digit string but confirm with Zimra first after the debacle with Kolfhurst)
+
+    activation_key: str (should be 0 padded 8 digit string. For example: '00398834')
+
+    certificate_filename: string (prospective file name for the certificate)
+
+    private_key_filename: (prospective file name for the private key)
+
+    prod: bool  (True for production, False for testing)
     '''
     if not os.path.exists(f'{folder_name}'):
         os.makedirs(f'{folder_name}')
@@ -159,6 +155,7 @@ def register_new_device(
         logging.fatal(f"Request failed with status code {response.status_code}")
         logging.critical(response.text)
 
+
 def tax_calculator(sale_amount, tax_rate):
     # convert the tax rate to a decimal
     tax_rate = (tax_rate / 100)
@@ -199,6 +196,37 @@ class Device:
         self.serialNo = serialNo
         self.activationKey = activationKey
 
+        # New: deviceOperatingMode will be refreshed before operations (Option A)
+        self.deviceOperatingMode = None  # "Online" or "Offline"
+
+    # ----------------------
+    # Helper methods
+    # ----------------------
+    def refresh_operating_mode(self):
+        """Refresh deviceOperatingMode by calling GetConfig"""
+        try:
+            config = self.getConfig()
+            # getConfig returns string error or dict; guard against that
+            if isinstance(config, dict) and 'deviceOperatingMode' in config:
+                self.deviceOperatingMode = config['deviceOperatingMode']
+                logging.info(f"Device operating mode refreshed: {self.deviceOperatingMode}")
+                return self.deviceOperatingMode
+            else:
+                logging.warning("Could not refresh deviceOperatingMode; getConfig returned unexpected response.")
+                return None
+        except Exception as e:
+            logging.warning(f"refresh_operating_mode failed: {e}")
+            return None
+
+    def isOffline(self):
+        """Return True if deviceOperatingMode is Offline. Refreshes the mode first (Option A)."""
+        self.refresh_operating_mode()
+        return str(self.deviceOperatingMode).lower() == 'offline'
+
+    def isOnline(self):
+        """Return True if deviceOperatingMode is Online. Refreshes the mode first (Option A)."""
+        self.refresh_operating_mode()
+        return str(self.deviceOperatingMode).lower() == 'online'
 
     def tax_calculator(self, sale_amount:float, tax_rate: int)-> float:
         # convert the tax rate to a decimal
@@ -234,40 +262,7 @@ class Device:
     
     def getConfig(self)->dict:
         '''returns:
-        {
-            'taxPayerName': 'SAINTFORD VENTURES', 
-            'taxPayerTIN': '2000253679', 
-            'vatNumber': '220227652', 
-            'deviceSerialNo': '9029D38C011B', 
-            'deviceBranchName': 'SAINTFORD VENTURES (PVT) LTD', 
-            'deviceBranchAddress': {'province': 'Harare', 'street': 'Plymouth road', 'houseNo': '44', 'city': 'Harare'}, 
-            'deviceBranchContacts': {'phoneNo': '0776298764', 'email': 'saintfordventures@gmail.com'}, 
-            'deviceOperatingMode': 'Online', 
-            'taxPayerDayMaxHrs': 24, 
-            'applicableTaxes': [{
-                'taxName': 'Exempt', 
-                'validFrom': '2023-01-01T00:00:00', 
-                'taxID': 1
-                }, 
-                {'taxPercent': 0.0, 
-                'taxName': 'Zero rate 0%', 
-                'validFrom': '2023-01-01T00:00:00', 
-                'taxID': 2
-                }, 
-                {'taxPercent': 15.0, 
-                'taxName': 'Standard rated 15%', 
-                'validFrom': '2023-01-01T00:00:00', 
-                'taxID': 3}, 
-                {'taxPercent': 5.0, 
-                'taxName': 'Non-VAT Withholding Tax', 
-                'validFrom': '2024-01-01T00:00:00', 
-                'taxID': 514
-                }], 
-            'certificateValidTill': '2027-07-31T06:26:09', 
-            'qrUrl': 'https://fdmstest.zimra.co.zw', 
-            'taxpayerDayEndNotificationHrs': 2, 
-            'operationID': '0HN4FDK6SREE1:00000001'
-        }
+        example structure...
         ''' 
         url = f'{self.deviceBaseUrl}/GetConfig'
         response = requests.get(
@@ -283,7 +278,7 @@ class Device:
             data = response.json()
             return data
         else:
-            return(f"Error: {response.status_code} - {response.text}")
+            return({"Error": f"Error: {response.status_code} - {response.text}"})
 
     def renewCertificate(self):
         '''
@@ -338,19 +333,25 @@ class Device:
                 json=data,
             )
             response.raise_for_status() 
-            # Save the certificate to a file
-            with open(f'{self.company_name}.crt', 'w') as cert_file:
-                cert_file.write(response['certificate'])
-            return response['certificate']
-
+            response_json = response.json()
+            certificate = response_json.get('certificate')
+            if certificate:
+                # Save the certificate to a file
+                with open(f'{self.companyName}.crt', 'w') as cert_file:
+                    cert_file.write(certificate)
+                return certificate
+            else:
+                return {"Error": "No certificate returned from IssueCertificate"}
         except requests.exceptions.HTTPError as http_err:
             # Print detailed error message from the response
-            error_response = response.json()
+            try:
+                error_response = response.json()
+            except Exception:
+                error_response = response.text
             ret_statement = f"HTTP error occurred: {http_err}\n\nResponse: {error_response}"
-            return ret_statement
-
+            return {"Error": ret_statement}
         except Exception as err:
-            return(f"Other error occurred: {err}")
+            return({"Error": f"Other error occurred: {err}"})
 
     def getStatus(self)->dict:
         '''
@@ -410,15 +411,19 @@ class Device:
             'operationID': '0HN4FDK6T1CNI:00000001'
         }
         '''
+        # Refresh operating mode and ensure we are not in Offline-only mode (openDay requires online mode per spec)
+        self.refresh_operating_mode()
+
         fiscalDayOpened = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
         #check if the day is closed
         status = self.getStatus()
-        if status['fiscalDayStatus'] != 'FiscalDayClosed':
-            return {"error": f"Fiscal Day {status['lastFiscalDayNo']} is not closed"}
+        if isinstance(status, dict) and status.get('fiscalDayStatus') and status.get('fiscalDayStatus') != 'FiscalDayClosed':
+            return {"error": f"Fiscal Day {status.get('lastFiscalDayNo')} is not closed"}
         
         #check if day being requested to be opened is later than the last day closed
-        if fiscalDayNo <= status['lastFiscalDayNo']:
-            return {"error": f"Fiscal Day being opened: day {fiscalDayNo} is earlier than the last closed day: day {status['lastFiscalDayNo']}"}
+        if isinstance(status, dict) and status.get('lastFiscalDayNo') is not None:
+            if fiscalDayNo <= status['lastFiscalDayNo']:
+                return {"error": f"Fiscal Day being opened: day {fiscalDayNo} is earlier than the last closed day: day {status['lastFiscalDayNo']}"}
 
             
         url = f'{self.deviceBaseUrl}/OpenDay'
@@ -531,10 +536,10 @@ class Device:
             receiptTaxes = receiptData["receiptTaxes"]
             concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)  
             if previous_hash:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int(receiptData["receiptTotal"]*100)}{concatenated_receipt_taxes}{previous_hash}"
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int(receiptData['receiptTotal']*100)}{concatenated_receipt_taxes}{previous_hash}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
             else:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int(receiptData["receiptTotal"]*100)}{concatenated_receipt_taxes}"
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int(receiptData['receiptTotal']*100)}{concatenated_receipt_taxes}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
                 
             hash_value = self.get_hash(string_to_sign)
@@ -626,10 +631,15 @@ class Device:
         '''
         Level: Critical
         uses self.deviceID and receipt data to submit receipt
-        here is how it happens
-        the method takes in the receipt data computes the hash using required fields, signs the same fields using the device private key
-        after this (ideally it should check the signature before), it submits the receipt to the fdms server
+        the method refreshes deviceOperatingMode and then submits receipt
         '''
+
+        # Refresh and ensure device is allowed to submit receipts in current mode
+        self.refresh_operating_mode()
+
+        if self.deviceOperatingMode and str(self.deviceOperatingMode).lower() == 'offline':
+            # According to spec, SubmitReceipt can't be sent if DeviceOperatingMode is Offline.
+            return {"error": "Device operating mode is Offline. SubmitReceipt is not allowed in Offline mode (DEV01)."}
 
         url = f'{self.deviceBaseUrl}/SubmitReceipt'
         headers = {
@@ -641,7 +651,7 @@ class Device:
 
         fields = [
             "receiptType", # string "FISCALINVOICE" | "CREDITNOTE" | "DEBITNOTE"
-            "receiptCurrency", # string USD|ZWG
+            "receiptCurrency", # string USD|ZiG
             "receiptCounter", # int
             "receiptGlobalNo", # int
             "invoiceNo", # unique string
@@ -676,11 +686,118 @@ class Device:
             data = response.json()
             return data
         else:
-            # raise an Exception if the response is not 200
+            # return response information consistent with existing library style
             response_object = {response.status_code: response.text}
             return response_object
             
-        
+    def submitFile(self, file_json: dict, filename: str = "file.json") -> dict:
+        """
+        Submit a batch file (header, content, footer) to FDMS.
+        The file must be a JSON object (dict) with "header" and optional "content" and "footer".
+        The JSON is base64-encoded and sent as multipart/form-data under the 'file' field.
+        Enforces Offline-only rule (refreshes deviceOperatingMode before sending).
+        """
+        # Refresh operating mode per Option A
+        self.refresh_operating_mode()
+
+        # Enforce Offline mode requirement
+        if self.deviceOperatingMode and str(self.deviceOperatingMode).lower() != 'offline':
+            return {"error": "Device operating mode is not Offline. submitFile can only be sent in Offline mode (DEV01)."}
+
+        # prepare base64 content
+        try:
+            # Ensure compact encoding to reduce size
+            json_bytes = json.dumps(file_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            b64_bytes = base64.b64encode(json_bytes)
+        except Exception as e:
+            logging.error(f"Failed to encode file json: {e}")
+            return {"error": f"Failed to encode file json: {e}"}
+
+        # Check size limit: 3 MB
+        max_size = 3 * 1024 * 1024  # 3 MB
+        if len(b64_bytes) > max_size:
+            return {"error": f"Encoded file too large: {len(b64_bytes)} bytes (max {max_size}). Split the file into smaller chunks."}
+
+        url = f"{self.deviceBaseUrl}/SubmitFile"
+
+        files = {
+            # ('filename', fileobj, content_type)
+            "file": (filename, b64_bytes, "application/octet-stream")
+        }
+
+        headers = {
+            'DeviceModelName': self.deviceModelName,
+            'DeviceModelVersion': self.deviceModelVersion
+            # Do not set Content-Type for multipart; requests will set it.
+        }
+
+        try:
+            response = requests.post(
+                url,
+                cert=(self.certPath, self.keyPath),
+                files=files,
+                headers=headers,
+                timeout=60
+            )
+            # Accept 200 or 202 as success depending on server behavior
+            if response.status_code in (200, 202):
+                try:
+                    return response.json()
+                except Exception:
+                    return {"status_code": response.status_code, "text": response.text}
+            else:
+                logging.error(f"submitFile failed: {response.status_code} - {response.text}")
+                return {response.status_code: response.text}
+        except requests.exceptions.RequestException as e:
+            logging.error(f"submitFile HTTP error: {e}")
+            return {"error": str(e)}
+
+    def getFileStatus(self, fileUploadedFrom: str = None, fileUploadedTill: str = None, operationID: str = None):
+        """
+        Query FDMS for previously uploaded file statuses.
+        Parameters:
+            fileUploadedFrom: 'YYYY-MM-DD' (required unless operationID provided)
+            fileUploadedTill: 'YYYY-MM-DD' (required unless operationID provided)
+            operationID: optional operationID returned by submitFile
+        """
+        # Refresh operating mode (per Option A)
+        self.refresh_operating_mode()
+
+        # Per spec, GetFileStatus is allowed in Offline mode only.
+        if self.deviceOperatingMode and str(self.deviceOperatingMode).lower() != 'offline':
+            return {"error": "Device operating mode is not Offline. getFileStatus can only be called in Offline mode (DEV01)."}
+
+        url = f"{self.deviceBaseUrl}/GetFileStatus"
+        params = {}
+        if operationID:
+            params["operationID"] = operationID
+        else:
+            # fileUploadedFrom and fileUploadedTill mandatory if operationID not provided
+            if not fileUploadedFrom or not fileUploadedTill:
+                return {"error": "fileUploadedFrom and fileUploadedTill are required if operationID is not provided."}
+            params["fileUploadedFrom"] = fileUploadedFrom
+            params["fileUploadedTill"] = fileUploadedTill
+
+        try:
+            response = requests.get(
+                url,
+                cert=(self.certPath, self.keyPath),
+                headers={
+                    'DeviceModelName': self.deviceModelName,
+                    'DeviceModelVersion': self.deviceModelVersion
+                },
+                params=params,
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logging.error(f"getFileStatus failed: {response.status_code} - {response.text}")
+                return {response.status_code: response.text}
+        except requests.exceptions.RequestException as e:
+            logging.error(f"getFileStatus HTTP error: {e}")
+            return {"error": str(e)}
+
     def generate_qr_code(self, signature: str, receipt_global_no, receipt_date=datetime.now().date()):
         """
         Parameters:
@@ -748,6 +865,13 @@ class Device:
             hash = get_hash(string_to_implement)
             signature = sign_data(data=hash, private_key_pem=private_key_pem)
         '''
+        # Refresh operating mode per Option A
+        self.refresh_operating_mode()
+
+        # closeDay requires Online mode (spec: request can't be sent if DeviceOperatingMode is Offline)
+        if self.deviceOperatingMode and str(self.deviceOperatingMode).lower() == 'offline':
+            return {"error": "Device operating mode is Offline. closeDay is not allowed in Offline mode (DEV01)."}
+
         if lastReceiptCounterValue==None or fiscalDayCounters==None or fiscalDayCounters==[]:
             lastReceiptCounterValue = 0
             string_to_implement = f'{self.deviceID}{fiscalDayNo}{fiscalDayDate}'
@@ -864,4 +988,3 @@ class Device:
         except ValueError:
             return f"Invalid JSON response"
         
-    
