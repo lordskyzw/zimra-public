@@ -1,4 +1,8 @@
 import os
+import math
+import decimal
+from decimal import Decimal
+from decimal import Decimal, ROUND_UP, ROUND_DOWN, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, ROUND_HALF_DOWN, ROUND_HALF_EVEN
 from bson import ObjectId
 import requests
 import datetime
@@ -20,11 +24,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 logging.basicConfig(level=logging.INFO)
 
 '''
-DISCLAIMER: THE FOLLOWING SOFTWARE IS DAUNTING AND VERY COMPLICATED. THIS FOLLOWS THE LAW THAT COMPLEXITY ALWAYS INCREASES, EVEN IN OUR ATTEMPTS TO DECREASE IT, 
+DISCLAIMER: THE FOLLOWING SOFTWARE IS DAUNTING AND VERY COMPLICATED. THIS FOLLOWS THE LAW COMPLEXITY ALWAYS INCREASES.
+EVEN IN OUR ATTEMPTS TO DECREASE IT, 
 
-PLEASE NOTE THAT THE FDMS IS A STATEFUL SYSTEM, SO YOU NEED TO KEEP TRACK OF THE FISCAL DAY NUMBER AND THE RECEIPT COUNTERS. THE LIBRARY DOES NOT KEEP TRACK OF THESE FOR YOU
-
-IN YOUR QUEST TO UNDERSTAND WHATS GOING ON HERE WITHOUT A BACKGROUND IN FISCALISATION, I, TARMICA CHIWARA, WOULD LIKE TO WISH YOU GOOD LUCK.
 
 
 Fiscal Device Gateway API can be accessed using HTTPS protocol via mTLS. 
@@ -52,6 +54,112 @@ def convert_objectid_to_str(data):
         return {k: str(v) if isinstance(v, ObjectId) else v for k, v in data.items()}
     return data
 
+
+
+def preprocess_receipt(receipt_data:dict) -> dict:
+    """
+    Preprocesses the receipt data to ensure it is in the correct format.
+
+    For each line of receipt line, unit_price, quantity and line_total price are converted strings
+
+    However, for accuracy, unit_price and quantity are converted to Decimal objects for the calculation of line_total.
+    The line_total is calculated as quantity * unit_price but we need to ensure it is a string upon return.
+
+    The output of this function can be fed directly to device.prepareReceipt() function as the receiptData parameter.
+
+    this function should be called after parse_document, processing continues in generate_receipt function
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    receipt_lines = receipt_data.get("receiptLines", [])
+    if receipt_lines:
+        for line in receipt_data.get("receiptLines", []):
+
+            # basic string conversion (sanitization)
+
+            line["unit_price"] = str(line["unit_price"])
+            unit_price = Decimal(line["unit_price"])
+
+
+            line["quantity"] = str(line["quantity"])
+            quantity = Decimal(line["quantity"])
+            
+            # line_total is calculated as quantity * unit_price but we need to ensure it is a string
+            line["line_total"] = str((quantity * unit_price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        
+        # now calculate and set the paymount amount
+        receipt_data["receiptPayments"][0]["paymentAmount"] = float(sum(Decimal(line["line_total"]) for line in receipt_lines))
+        return receipt_data
+    else:
+        raise ValueError("No receipt lines found in the receipt data.")
+
+def preprocess_tax_exclusivereceipt(receipt_data:dict) -> dict:
+    """
+    Preprocesses the receipt data to ensure it is in the correct format.
+
+    For each line of receipt line, unit_price, quantity and line_total price are converted strings
+
+    However, for accuracy, unit_price and quantity are converted to Decimal objects for the calculation of line_total.
+    The line_total is calculated as quantity * unit_price but we need to ensure it is a string upon return.
+
+    The output of this function can be fed directly to device.prepareReceipt() function as the receiptData parameter.
+
+    this function should be called after parse_document, processing continues in generate_receipt function
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    receipt_lines = receipt_data.get("receiptLines", [])
+    if receipt_lines:
+        for line in receipt_data.get("receiptLines", []):
+
+            # basic string conversion (sanitization)
+
+            line["unit_price"] = str(line["unit_price"])
+            unit_price = Decimal(line["unit_price"])
+
+
+            line["quantity"] = str(line["quantity"])
+            quantity = Decimal(line["quantity"])
+            
+            # line_total is calculated as quantity * unit_price but we need to ensure it is a string
+            line["line_total"] = str((quantity * unit_price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        
+        return receipt_data
+    else:
+        raise ValueError("No receipt lines found in the receipt data.")
+
+
+def tax_calculator(sale_amount, tax_rate):
+        """
+        Calculate VAT amount from a price that already includes VAT.
+        Uses Decimal to avoid floating point precision errors.
+        
+        Formula: VAT = total_amount - (total_amount / (1 + tax_rate/100))
+                = total_amount * (tax_rate/100) / (1 + tax_rate/100)
+        
+        Args:
+            total_amount (float or Decimal): The total amount including VAT
+            tax_rate (float or Decimal): The tax rate as a percentage (e.g., 20 for 20%)
+            
+        Returns:
+            Decimal: The VAT amount, rounded to 2 decimal places
+        """
+        # Set decimal precision
+        decimal.getcontext().prec = 28
+        
+        # Convert inputs to Decimal to avoid floating point errors
+        total_decimal = Decimal(str(sale_amount))
+        rate_decimal = Decimal(str(tax_rate))
+        
+        # Calculate the divisor (1 + tax_rate/100)
+        divisor = Decimal('1') + (rate_decimal / Decimal('100'))
+        
+        # Calculate pre-tax amount
+        pre_tax = total_decimal / divisor
+        
+        # Calculate VAT (total - pre_tax)
+        vat_amount = total_decimal - pre_tax
+        
+        # Round to 2 decimal places (rounding HALF_UP as per your accepted code)
+        return float(vat_amount.quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
 
 def register_new_device(
     
@@ -152,12 +260,6 @@ def register_new_device(
         logging.fatal(f"Request failed with status code {response.status_code}")
         logging.critical(response.text)
 
-def tax_calculator(sale_amount, tax_rate):
-    # convert the tax rate to a decimal
-    tax_rate = (tax_rate / 100)
-    # taxAmount must be equal to (((SUM(receiptLineTotal)) * taxPercent) / (1+taxPercent)) rounded to 2 decimal places
-    tax_amount = round(((sale_amount * tax_rate) / (1 + tax_rate)), 2)
-    return tax_amount
 
 class Device:
     def __init__(
@@ -168,8 +270,8 @@ class Device:
             cert_path: str, 
             private_key_path:str, 
             test_mode:bool =True, 
-            deviceModelName: str='Model123', 
-            deviceModelVersion:str = '1.0',
+            deviceModelName: str='Server', 
+            deviceModelVersion:str = 'v1',
             company_name:str ="NexusClient"
         ):
         self.companyName: str = company_name
@@ -179,12 +281,19 @@ class Device:
         self.certPath: str = cert_path
         self.keyPath: str = private_key_path
         
+        
         if test_mode:
+            self.test_mode = True
             self.base_url: str = 'https://fdmsapitest.zimra.co.zw/Device/v1/'
             self.qrUrl:str = 'https://fdmstest.zimra.co.zw/'
+            # Updated 2026: Standard VAT is now 15.5% (ID 515), Exempt is ID 3 and 15% is invalid
+            self.applicableTaxes: dict = {0: 2, 'exempt': 3, 5: 514, 15.5: 515}
         else:
+            self.test_mode = False
             self.base_url: str = 'https://fdmsapi.zimra.co.zw/Device/v1/'
             self.qrUrl:str = 'https://fdms.zimra.co.zw/'
+            # Updated 2026: Standard VAT is now 15.5% (ID 515), Exempt is ID 3 and 15% is invalid
+            self.applicableTaxes: dict = {0: 2, 'exempt': 3, 5: 514, 15.5: 515}
 
         self.deviceBaseUrl = f'{self.base_url}{self.deviceID}'
         
@@ -192,23 +301,109 @@ class Device:
         self.activationKey = activationKey
 
 
-    def tax_calculator(self, sale_amount:float, tax_rate: int)-> float:
-        # convert the tax rate to a decimal
-        tax_rate = (tax_rate / 100)
-        # taxAmount must be equal to (((SUM(receiptLineTotal)) * taxPercent) / (1+taxPercent)) rounded to 2 decimal places
-        tax_amount = round(((sale_amount * tax_rate) / (1 + tax_rate)), 2)
-        return tax_amount
+    def insert_receiptDeviceSignature(self, receiptData: OrderedDict, previous_hash=None)-> OrderedDict:
+        """
+        this is the final nail in the coffin before sending receipt to zimra
+        """
+
+        receiptTaxes = receiptData["receiptTaxes"]
+        logging.info(f"Library Info: Receipt Taxes: {receiptTaxes}")
+        concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)  
+        if previous_hash:
+            string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
+            logging.info(f"Library Info: string to sign: {string_to_sign}")
+        else:
+            string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
+            logging.info(f"Library Info: string to sign: {string_to_sign}")
+            
+        hash_value = self.get_hash(string_to_sign)
+        signature = self.sign_data(string_to_sign)
+        receiptData["receiptDeviceSignature"] = {
+            "hash": hash_value,
+            "signature": signature
+        }
+        
+        return receiptData
+
+
+    def tax_calculator(self, sale_amount, tax_rate):
+        """
+        Calculate VAT amount from a price that already includes VAT.
+        Uses Decimal to avoid floating point precision errors.
+        
+        Formula: VAT = total_amount - (total_amount / (1 + tax_rate/100))
+                = total_amount * (tax_rate/100) / (1 + tax_rate/100)
+        
+        Args:
+            total_amount (float or Decimal): The total amount including VAT
+            tax_rate (float or Decimal): The tax rate as a percentage (e.g., 20 for 20%)
+            
+        Returns:
+            Decimal: The VAT amount, rounded to 2 decimal places
+        """
+        # Set decimal precision
+        decimal.getcontext().prec = 28
+        
+        # Convert inputs to Decimal to avoid floating point errors
+        total_decimal = Decimal(str(sale_amount))
+        rate_decimal = Decimal(str(tax_rate))
+        
+        # Calculate the divisor (1 + tax_rate/100)
+        divisor = Decimal('1') + (rate_decimal / Decimal('100'))
+        
+        # Calculate pre-tax amount
+        pre_tax = total_decimal / divisor
+        
+        # Calculate VAT (total - pre_tax)
+        vat_amount = total_decimal - pre_tax
+        
+        # Round to 2 decimal places (rounding HALF_UP as per your accepted code)
+        return float(vat_amount.quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+
+
+    def tax_exclusive_calculator(self, sale_amount, tax_rate):
+        """
+        Calculate VAT amount from a price that does not include VAT.
+        Uses Decimal to avoid floating point precision errors.
+
+        Formula: VAT = sale_amount * (tax_rate/100)
+
+        Args:
+            sale_amount (float or Decimal): The pre-tax amount
+            tax_rate (float or Decimal): The tax rate as a percentage (e.g., 20 for 20%)
+
+        Returns:
+            float: The VAT amount, rounded to 2 decimal places
+        """
+        # Set decimal precision
+        decimal.getcontext().prec = 28
+
+        # Convert inputs to Decimal to avoid floating point errors
+        sale_decimal = Decimal(str(sale_amount))
+        rate_decimal = Decimal(str(tax_rate))
+        
+        # Calculate VAT using the tax-exclusive formula
+        vat_amount = sale_decimal * (rate_decimal / Decimal('100'))
+        
+        # Round to 2 decimal places (rounding HALF_UP as per your accepted code)
+        return float(vat_amount.quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+
     
     def concatenate_receipt_taxes(self, receiptTaxes):
-        # Sort by taxID and taxCode (empty taxCode comes first)
-        receiptTaxes_sorted = sorted(receiptTaxes, key=lambda x: (x['taxID']))
-        # Concatenate each line without separators
+        # Sort by taxID
+        receiptTaxes_sorted = sorted(receiptTaxes, key=lambda x: x['taxID'])
+        logging.info(f"Library Info: Receipt Taxes Sorted: {receiptTaxes_sorted}")
+        
         concatenated_string = ''.join(
-            f"{float(tax['taxPercent']):.2f}{int(tax['taxAmount']*100)}{int(tax['salesAmountWithTax']*100)}" 
+            f"{(Decimal(tax['taxPercent']).quantize(Decimal('0.00'), rounding=None) if 'taxPercent' in tax else '')}"
+            f"{int((Decimal(tax['taxAmount']) * Decimal('100')).quantize(Decimal('1'), rounding=None))}"
+            f"{int((Decimal(tax['salesAmountWithTax']) * Decimal('100')).quantize(Decimal('1'), rounding=None))}"
             for tax in receiptTaxes_sorted
         )
-
+        
+        logging.info(f"Library Info: Concatenated Receipt Taxes: {concatenated_string}")
         return concatenated_string
+
 
 
     def get_hash(self, data:str)->str:
@@ -225,7 +420,10 @@ class Device:
         return base64.b64encode(signature).decode('utf-8')
     
     def getConfig(self)->dict:
-        '''returns:
+        '''
+        this function should always be run to get the updated configuration including the taxes
+        
+        returns:
         {
             'taxPayerName': 'SAINTFORD VENTURES', 
             'taxPayerTIN': '2000253679', 
@@ -409,9 +607,12 @@ class Device:
             return {"error": f"Fiscal Day {status['lastFiscalDayNo']} is not closed"}
         
         #check if day being requested to be opened is later than the last day closed
-        if fiscalDayNo <= status['lastFiscalDayNo']:
-            return {"error": f"Fiscal Day being opened: day {fiscalDayNo} is earlier than the last closed day: day {status['lastFiscalDayNo']}"}
-
+        try:
+            if fiscalDayNo <= status['lastFiscalDayNo']:
+                return {"error": f"Fiscal Day being opened: day {fiscalDayNo} is earlier than the last closed day: day {status['lastFiscalDayNo']}"}
+        except KeyError:
+            #device is brand new
+            pass
             
         url = f'{self.deviceBaseUrl}/OpenDay'
         headers = {
@@ -441,78 +642,116 @@ class Device:
         except ValueError:
             return {"error": "Invalid JSON response"}
 
-    def prepareReceipt(self, receiptData: dict, previousReceiptHash = None) -> dict:
+    def prepareReceipt(
+            self, 
+            receiptData: dict, 
+            applicableTaxes: dict=None,
+            previousReceiptHash = None) -> dict:
         '''
         Level: Critical
         This function extracts required information from a receipt reliably and formats it 
         for the submitReceipt method.
         '''
-        
+        if not applicableTaxes:
+            applicableTaxes = self.applicableTaxes
         def receiptlinesfixer(receipt: dict) -> dict:
             """
             Fixes the receipt lines to conform with what the ZIMRA API accepts.
-            newly added HS codes, if no HS codes are present in the presented receipt we are adding
-            the default HS code 04021099
+            For exempt items (where tax_percent is provided as "E", "exempt", etc.),
+            the taxPercent field is omitted while still assigning the proper taxID.
             """
             def taxID(line):
-                tax_percent = float(line['tax_percent'])
-                if int(tax_percent) == 0:
-                    return 2
-                elif tax_percent == 5:
-                    return 1
-                elif tax_percent == 15:
-                    return 3
+                # If the tax_percent indicates exemption
+                if isinstance(line['tax_percent'], str) and line['tax_percent'].lower() in ['e', 'exempt']:
+                    # Use applicableTaxes dict for exempt ID
+                    return self.applicableTaxes.get('exempt', 3)
+                # Otherwise, convert to float and assign tax IDs based on value.
+                tax_percent_val = float(line['tax_percent'])
+                if tax_percent_val == 0:
+                    return self.applicableTaxes.get(0, 2)
+                elif tax_percent_val == 5:
+                    return self.applicableTaxes.get(5, 514)
+                elif tax_percent_val == 15.5:
+                    # New 2026 standard rate
+                    return self.applicableTaxes.get(15.5, 515)
+                elif tax_percent_val == 15:
+                    # Legacy 15% - check if we have it, otherwise use 15.5%
+                    if 15 in self.applicableTaxes:
+                        return self.applicableTaxes.get(15, 3)
+                    else:
+                        # Fallback to 15.5% if 15% not available
+                        return self.applicableTaxes.get(15.5, 515)
                 else:
-                    raise ValueError(f"Invalid tax_percent value: {tax_percent}")
-                
+                    raise ValueError(f"Invalid tax_percent value: {line['tax_percent']}")
+
             receiptlines = receipt['receiptLines']
             output_receipt_lines = []
-
+            
             for i, line in enumerate(receiptlines):
+                # Determine if the line is exempt.
+                is_exempt = isinstance(line['tax_percent'], str) and line['tax_percent'].lower() in ['e', 'exempt']
                 fixed_line = {
                     'receiptLineType': 'Sale',
                     'receiptLineNo': i + 1,
-                    'receiptLineHSCode': '04021099' if 'hs_code' not in line else line['hs_code'],
+                    'receiptLineHSCode': line.get('hs_code', '04021099'),
                     'receiptLineName': line['item_name'],
                     'receiptLinePrice': line['unit_price'],
                     'receiptLineQuantity': line['quantity'],
-                    'receiptLineTotal': float(line['quantity']) * float(line['unit_price']),
-                    'taxPercent': line['tax_percent'],
+                    'receiptLineTotal': float((Decimal(line['quantity']) * Decimal(line['unit_price'])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)), #changed 
                     'taxID': taxID(line)
                 }
+                if not is_exempt and line['tax_percent'] is not None:
+                    fixed_line['taxPercent'] = float(line['tax_percent'])
+
                 output_receipt_lines.append(fixed_line)
                 
             receipt["receiptLines"] = output_receipt_lines
             return receipt
-
         def taxlines_fixer(receipt: OrderedDict) -> OrderedDict:
             """
-            Takes in the receipt after the receiptLinesFixer function.
             Inserts consolidated tax lines into the receipt after the receiptLines.
-            basically this function does the actual taxes so take your time on it. 
+            For receipt lines without a taxPercent field (exempt items), we treat the tax rate as 0.
+            In the resulting receiptTaxes, for exempt taxes (taxID == 1) the taxPercent key is omitted.
             """
             receipt_with_taxlines = OrderedDict()
             for key, value in receipt.items():
                 receipt_with_taxlines[key] = value
-                # we copy all the fields from the previous receipt until we get to the receiptLines part after which we need to inject
                 if key == "receiptLines":
                     tax_lines = defaultdict(lambda: {"taxAmount": 0, "salesAmountWithTax": 0})
                     for item in receipt["receiptLines"]:
-                        tax_percent = round(float(item["taxPercent"]),2) # should be a float with up to 2 decimal places
-                        tax_id = int(item["taxID"]) # should be an integer 
-                        tax_lines[(tax_percent, tax_id)]["taxAmount"] += self.tax_calculator(item["receiptLineTotal"], tax_percent)
-                        tax_lines[(tax_percent, tax_id)]["salesAmountWithTax"] += item["receiptLineTotal"]
-                        tax_lines[(tax_percent, tax_id)]["taxPercent"] = tax_percent
-                        tax_lines[(tax_percent, tax_id)]["taxID"] = tax_id
-                    receipt_with_taxlines["receiptTaxes"] = [
-                        {
-                            "taxPercent": float("{:.2f}".format(float(key[0]))),
-                            "taxID": key[1],
-                            "taxAmount": self.tax_calculator(sale_amount=value["salesAmountWithTax"], tax_rate=float("{:.2f}".format(float(key[0])))),
-                            "salesAmountWithTax": value["salesAmountWithTax"]
+                        # If taxPercent exists, use it; otherwise, it's exempt.
+                        if "taxPercent" in item:
+                            try:
+                                tax_percent = round(float(item["taxPercent"]), 2)
+                                grouping_key = (tax_percent, int(item["taxID"]))
+                            except ValueError:
+                                #tax is exempt and taxPercent should be removed
+                                grouping_key = ("exempt", int(item["taxID"]))
+                                tax_percent = 0  # For calculation purposes only.
+                        else:
+                            grouping_key = ("exempt", int(item["taxID"]))
+                            tax_percent = 0  # For calculation purposes only.
+                        tax_lines[grouping_key]["taxAmount"] += self.tax_calculator(
+                            item["receiptLineTotal"], tax_percent)
+                        tax_lines[grouping_key]["salesAmountWithTax"] += item["receiptLineTotal"]
+                        tax_lines[grouping_key]["taxID"] = int(item["taxID"])
+                        if "taxPercent" in item:
+                            tax_lines[grouping_key]["taxPercent"] = tax_percent
+                    receipt_with_taxlines["receiptTaxes"] = []
+                    for group_key, group_value in tax_lines.items():
+                        # group_key is either (numeric_tax, taxID) or ("exempt", taxID)
+                        tax_obj = {
+                            "taxID": group_value["taxID"],
+                            "taxAmount": self.tax_calculator(
+                                sale_amount=group_value["salesAmountWithTax"],
+                                tax_rate=0 if group_key[0] == "exempt" else group_key[0]
+                            ),
+                            "salesAmountWithTax": float(Decimal(group_value["salesAmountWithTax"]).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
                         }
-                        for key, value in tax_lines.items()
-                    ]
+                        # Include taxPercent only if this is not an exempt grouping.
+                        if group_key[0] != "exempt":
+                            tax_obj["taxPercent"] = float("{:.2f}".format(group_key[0]))
+                        receipt_with_taxlines["receiptTaxes"].append(tax_obj)
             return receipt_with_taxlines
 
         def insert_receiptDeviceSignature(receiptData: OrderedDict, previous_hash=previousReceiptHash)-> OrderedDict:
@@ -521,12 +760,13 @@ class Device:
             """
  
             receiptTaxes = receiptData["receiptTaxes"]
+            logging.info(f"Library Info: Receipt Taxes: {receiptTaxes}")
             concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)  
             if previous_hash:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int(receiptData["receiptTotal"]*100)}{concatenated_receipt_taxes}{previous_hash}"
+                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
             else:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int(receiptData["receiptTotal"]*100)}{concatenated_receipt_taxes}"
+                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
                 
             hash_value = self.get_hash(string_to_sign)
@@ -591,7 +831,9 @@ class Device:
         prepared_receipt['receiptLinesTaxInclusive'] = True
 
         # Compute the total
-        prepared_receipt['receiptTotal'] = sum([float(line['unit_price']) * float(line['quantity']) for line in receiptData['receiptLines']])
+        prepared_receipt['receiptTotal'] = sum((float((Decimal(line['quantity']) * Decimal(line['unit_price'])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))) for line in receiptData['receiptLines'])
+            
+
 
         # Extracting optional fields if present
         for field in optional_fields:
@@ -608,9 +850,267 @@ class Device:
                 reordered_receipt["receiptLinesTaxInclusive"] = True
         reordered_receipt = receiptlinesfixer(reordered_receipt)
         reordered_receipt = taxlines_fixer(receipt=reordered_receipt)
+        
+        
+        # check for floating point errors in receiptTotal and paymentAmount and round to 2 decimal places
+        #where is payment amount coming from?
+
+        reordered_receipt['receiptTotal'] = float(Decimal(reordered_receipt['receiptTotal']).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        reordered_receipt['receiptPayments'][0]['paymentAmount'] = float(Decimal(reordered_receipt['receiptPayments'][0]['paymentAmount']).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         if reordered_receipt['receiptTotal'] != reordered_receipt['receiptPayments'][0]['paymentAmount']:
-            logging.info(f"Library Error: Receipt total ({reordered_receipt['receiptTotal']}) does not match payment amount ({reordered_receipt['receiptPayments'][0]['paymentAmount']}).\n fixing that though")
-            reordered_receipt['receiptTotal']=float(reordered_receipt['receiptPayments'][0]['paymentAmount'])
+            logging.info(f"Library Error: calculated Receipt total ({reordered_receipt['receiptTotal']}) does not match provided payment amount ({reordered_receipt['receiptPayments'][0]['paymentAmount']}).\n fixing that though")
+            reordered_receipt['receiptTotal'] = float(Decimal(reordered_receipt['receiptTotal']).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            reordered_receipt['receiptPayments'][0]['paymentAmount'] = reordered_receipt['receiptTotal']
+            logging.info(f"Library Info:due to trust issues Receipt total fixed to {reordered_receipt['receiptTotal']} which was CALCULATED")
+        reordered_receipt = insert_receiptDeviceSignature(receiptData=reordered_receipt)
+        return reordered_receipt
+
+
+    def prepareReceiptTaxExclusive(
+        self, 
+        receiptData: dict, 
+        applicableTaxes: dict = None,
+        previousReceiptHash = None) -> dict:
+        '''
+        Level: Critical
+        This function extracts required information from a receipt (with tax exclusive pricing)
+        and formats it for the submitReceipt method.
+        '''
+        if not applicableTaxes:
+            applicableTaxes = self.applicableTaxes
+
+        def receiptlinesfixer(receipt: dict) -> dict:
+            """
+            Fixes the receipt lines to conform with what the ZIMRA API accepts.
+            For exempt items (where tax_percent is provided as "E", "exempt", etc.),
+            the taxPercent field is omitted while still assigning the proper taxID.
+            """
+            def taxID(line):
+                # If the tax_percent indicates exemption
+                if isinstance(line['tax_percent'], str) and line['tax_percent'].lower() in ['e', 'exempt']:
+                    if self.test_mode:
+                        return 1
+                    else:
+                        return 3
+                # Otherwise, convert to float and assign tax IDs based on value.
+                tax_percent_val = float(line['tax_percent'])
+                if tax_percent_val == 0:
+                    return applicableTaxes.get(0, 2)
+                elif tax_percent_val == 5:
+                    return applicableTaxes.get(5, 514)
+                elif tax_percent_val == 15:
+                    # Legacy 15% - check if we have it, otherwise use 15.5%
+                    if 15 in self.applicableTaxes:
+                        return self.applicableTaxes.get(15, 3)
+                    else:
+                        # Fallback to 15.5% if 15% not available
+                        return self.applicableTaxes.get(15.5, 515)
+                elif tax_percent_val == 15.5:
+                    # New 2026 standard rate
+                    return applicableTaxes.get(15.5, 515)
+                else:
+                    raise ValueError(f"Invalid tax_percent value: {line['tax_percent']}")
+
+            receiptlines = receipt['receiptLines']
+            output_receipt_lines = []
+            
+            for i, line in enumerate(receiptlines):
+                # Determine if the line is exempt.
+                is_exempt = isinstance(line['tax_percent'], str) and line['tax_percent'].lower() in ['e', 'exempt']
+                # For tax exclusive, the receipt line total is the pre-tax total.
+                line_total = float((Decimal(str(line['quantity'])) * Decimal(str(line['unit_price']))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                fixed_line = {
+                    'receiptLineType': 'Sale',
+                    'receiptLineNo': i + 1,
+                    'receiptLineHSCode': line.get('hs_code', '04021099'),
+                    'receiptLineName': line['item_name'],
+                    'receiptLinePrice': line['unit_price'],
+                    'receiptLineQuantity': line['quantity'],
+                    'receiptLineTotal': line_total,
+                    'taxID': taxID(line)
+                }
+                # Only add the taxPercent field if the item is not exempt AND tax_percent is not None.
+                if not is_exempt and line['tax_percent'] is not None:
+                    fixed_line['taxPercent'] = float(line['tax_percent'])
+                output_receipt_lines.append(fixed_line)
+                
+            receipt["receiptLines"] = output_receipt_lines
+            return receipt
+
+        def taxlines_fixer(receipt: OrderedDict) -> OrderedDict:
+            """
+            Inserts consolidated tax lines into the receipt after the receiptLines.
+            For receipt lines without a taxPercent field (exempt items), we treat the tax rate as 0.
+            In the resulting receiptTaxes, for exempt taxes (taxID == 1) the taxPercent key is omitted.
+            
+            FIX: Calculate VAT on the SUMMED TOTAL, not per-line, to avoid rounding errors.
+            Example: 4 items @ $0.87 = $3.48
+            - Per-line: $0.87 × 15.5% = $0.13 → 4 × $0.13 = $0.52 ❌
+            - On-total: $3.48 × 15.5% = $0.54 ✅
+            """
+            receipt_with_taxlines = OrderedDict()
+            for key, value in receipt.items():
+                receipt_with_taxlines[key] = value
+                if key == "receiptLines":
+                    # Initialize tax groups - only accumulate salesAmount, calculate tax later
+                    tax_lines = defaultdict(lambda: {"salesAmount": Decimal('0.00'), "taxID": None, "taxPercent": None})
+                    for item in receipt["receiptLines"]:
+                        # Use taxPercent if available; otherwise, treat as exempt.
+                        if "taxPercent" in item:
+                            try:
+                                tax_percent = round(float(item["taxPercent"]), 2)
+                                grouping_key = (tax_percent, int(item["taxID"]))
+                            except ValueError:
+                                grouping_key = ("exempt", int(item["taxID"]))
+                                tax_percent = 0  # For calculation purposes only.
+                        else:
+                            grouping_key = ("exempt", int(item["taxID"]))
+                            tax_percent = 0  # For calculation purposes only.
+
+                        # Accumulate the pre-tax line amount only (no per-line tax calculation)
+                        line_total = Decimal(str(item["receiptLineTotal"]))
+                        tax_lines[grouping_key]["salesAmount"] += line_total
+                        tax_lines[grouping_key]["taxID"] = int(item["taxID"])
+                        if "taxPercent" in item:
+                            tax_lines[grouping_key]["taxPercent"] = tax_percent
+
+                    receipt_with_taxlines["receiptTaxes"] = []
+                    for group_key, group_value in tax_lines.items():
+                        pre_tax_sales = group_value["salesAmount"]
+                        # FIX: Calculate VAT on the SUMMED TOTAL, not sum of per-line VAT
+                        effective_rate = 0 if group_key[0] == "exempt" else group_key[0]
+                        tax_amount = Decimal(str(self.tax_exclusive_calculator(
+                            sale_amount=float(pre_tax_sales),
+                            tax_rate=effective_rate
+                        )))
+                        # For tax exclusive receipts, sales amount with tax is the base plus its tax.
+                        sales_amount_with_tax = pre_tax_sales + tax_amount
+                        tax_obj = {
+                            "taxID": group_value["taxID"],
+                            "taxAmount": float(tax_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)),
+                            "salesAmountWithTax": float(sales_amount_with_tax.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                        }
+                        # Include taxPercent only if this group is not an exempt grouping.
+                        if group_key[0] != "exempt":
+                            tax_obj["taxPercent"] = float("{:.2f}".format(group_key[0]))
+                        receipt_with_taxlines["receiptTaxes"].append(tax_obj)
+            return receipt_with_taxlines
+
+        def insert_receiptDeviceSignature(receiptData: OrderedDict, previous_hash=previousReceiptHash) -> OrderedDict:
+            """
+            Finalizes the receipt before sending it to ZIMRA by inserting the device signature.
+            """
+            receiptTaxes = receiptData["receiptTaxes"]
+            logging.info(f"Library Info: Receipt Taxes: {receiptTaxes}")
+            concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)
+            if previous_hash:
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
+                logging.info(f"Library Info: string to sign: {string_to_sign}")
+            else:
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
+                logging.info(f"Library Info: string to sign: {string_to_sign}")
+                
+            hash_value = self.get_hash(string_to_sign)
+            signature = self.sign_data(string_to_sign)
+            receiptData["receiptDeviceSignature"] = {
+                "hash": hash_value,
+                "signature": signature
+            }
+            return receiptData
+
+        # Mandatory fields
+        mandatory_fields = [
+            "receiptType",        # "FISCALINVOICE" | "CREDITNOTE" | "DEBITNOTE"
+            "receiptCurrency",    # e.g., USD | ZWG
+            "receiptCounter",     # integer
+            "receiptGlobalNo",    # integer
+            "invoiceNo",          # unique string
+            "receiptDate",        # datetime (formatted as %Y-%m-%dT%H:%M:%S)
+            "receiptLines",       # items (list of sold items)
+            "receiptPayments",    # e.g., "CASH" | "CARD" and their totals (as objects)
+        ]
+
+        # Optional fields
+        optional_fields = [
+            "buyerData",          # Optional buyer info
+            "creditDebitNote",    # Only mandatory for credit/debit notes
+            "receiptNotes"
+        ]
+
+        # For credit/debit notes, add extra mandatory fields.
+        prepared_receipt = OrderedDict()
+        if receiptData['receiptType'].lower() in ['creditnote', 'debitnote']:
+            mandatory_fields.append('receiptNotes')
+            mandatory_fields.append('creditDebitNote')
+
+        for field in mandatory_fields:
+            if field not in receiptData:
+                raise ValueError(f"Library Error: Missing mandatory field: {field}")
+            prepared_receipt[field] = receiptData[field]
+
+        # Formatting receiptDate to the required format.
+        if isinstance(prepared_receipt['receiptDate'], datetime):
+            prepared_receipt['receiptDate'] = prepared_receipt['receiptDate'].strftime('%Y-%m-%dT%H:%M:%S')
+        elif isinstance(prepared_receipt['receiptDate'], str):
+            try:
+                prepared_receipt['receiptDate'] = datetime.strptime(prepared_receipt['receiptDate'], '%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%dT%H:%M:%S')
+            except ValueError:
+                try:
+                    prepared_receipt['receiptDate'] = datetime.strptime(prepared_receipt['receiptDate'][:-5], '%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%dT%H:%M:%S')
+                    logging.info(f"Library Info: Manually formatted date: {prepared_receipt['receiptDate']}")
+                except ValueError:
+                    raise ValueError("Library Error: Invalid receiptDate format. Must match 'YYYY-MM-DDTHH:MM:SS' or similar.")
+        else:
+            raise ValueError("Library Error: Invalid receiptDate format. Must be a string or datetime object.")
+
+        # Mark receipt as tax exclusive.
+        prepared_receipt['receiptLinesTaxInclusive'] = False
+
+        # Compute the base total (pre-tax) for receipt lines.
+        base_total = sum(
+            float((Decimal(str(line['quantity'])) * Decimal(str(line['unit_price']))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            for line in receiptData['receiptLines']
+        )
+        # Initially set receiptTotal to the base total.
+        prepared_receipt['receiptTotal'] = base_total
+
+        # Include optional fields if present.
+        for field in optional_fields:
+            if field in receiptData:
+                prepared_receipt[field] = receiptData[field]
+
+        # Reorder the dictionary to place receiptLinesTaxInclusive right after receiptDate.
+        reordered_receipt = OrderedDict()
+        for key in list(prepared_receipt.keys()):
+            reordered_receipt[key] = prepared_receipt[key]
+            if key == "receiptDate":
+                reordered_receipt["receiptLinesTaxInclusive"] = False
+
+        # Fix receipt lines.
+        reordered_receipt = receiptlinesfixer(reordered_receipt)
+        # Process tax lines using tax exclusive calculations.
+        reordered_receipt = taxlines_fixer(receipt=reordered_receipt)
+
+        # Now adjust the overall receipt total: add computed tax totals from receiptTaxes.
+        total_tax = sum(
+            Decimal(str(tax_line["taxAmount"]))
+            for tax_line in reordered_receipt.get("receiptTaxes", [])
+        )
+        receipt_total = Decimal(str(base_total)) + total_tax
+        reordered_receipt['receiptTotal'] = float(receipt_total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+        # Also ensure payment amount is consistent.
+        payment_amount = Decimal(str(reordered_receipt['receiptPayments'][0]['paymentAmount']))
+        payment_amount = Decimal(str(reordered_receipt['receiptTotal']))
+        reordered_receipt['receiptPayments'][0]['paymentAmount'] = float(payment_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+        if reordered_receipt['receiptTotal'] != reordered_receipt['receiptPayments'][0]['paymentAmount']:
+            logging.info(f"Library Error: Calculated receipt total ({reordered_receipt['receiptTotal']}) does not match provided payment amount ({reordered_receipt['receiptPayments'][0]['paymentAmount']}). Adjusting accordingly.")
+            reordered_receipt['receiptTotal'] = float(receipt_total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            reordered_receipt['receiptPayments'][0]['paymentAmount'] = reordered_receipt['receiptTotal']
+            logging.info(f"Library Info: Receipt total fixed to {reordered_receipt['receiptTotal']} (calculated).")
+            
+        # Insert device signature.
         reordered_receipt = insert_receiptDeviceSignature(receiptData=reordered_receipt)
         return reordered_receipt
 
@@ -773,11 +1273,11 @@ class Device:
             concatenated_counters = ''.join(
                 f"{counter['fiscalCounterType'].upper()}"
                 f"{counter['fiscalCounterCurrency'].upper()}"
-                f"{'{:.2f}'.format(counter['fiscalCounterTaxPercent']) if counter.get('fiscalCounterTaxPercent') is not None else ''}"
+                f"{str(Decimal(counter['fiscalCounterTaxPercent']).quantize(Decimal('0.00'), rounding=ROUND_UP)) if counter.get('fiscalCounterTaxPercent') is not None else ''}"
                 f"{money_type_mapping.get(counter.get('fiscalCounterMoneyType'), '')}"  # Map money type to string
-                f"{int(float(counter['fiscalCounterValue']) * 100)}"  # Convert to cents
+                f"{int((Decimal(counter['fiscalCounterValue']) * Decimal('100')).quantize(Decimal('1'), rounding=None))}"
                 for counter in sorted_counters
-                if float(counter['fiscalCounterValue']) != float(0)
+                if Decimal(counter['fiscalCounterValue']) != Decimal('0')
             )
             # Final string
             logging.info(f"Concatenated Counters===================: {concatenated_counters}")
