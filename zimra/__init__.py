@@ -646,7 +646,9 @@ class Device:
             self, 
             receiptData: dict, 
             applicableTaxes: dict=None,
-            previousReceiptHash = None) -> dict:
+            previousReceiptHash = None,
+            receiptPrintForm: str="Receipt48"
+        ) -> dict:
         '''
         Level: Critical
         This function extracts required information from a receipt reliably and formats it 
@@ -827,6 +829,9 @@ class Device:
         else:
             raise ValueError("Library Error: Invalid receiptDate format. Must be a string or datetime object.")
 
+        # Set receiptPrintForm from the function parameter
+        prepared_receipt['receiptPrintForm'] = receiptPrintForm
+
         # Insert receiptLinesTaxInclusive right after receiptDate
         prepared_receipt['receiptLinesTaxInclusive'] = True
 
@@ -870,7 +875,8 @@ class Device:
         self, 
         receiptData: dict, 
         applicableTaxes: dict = None,
-        previousReceiptHash = None) -> dict:
+        previousReceiptHash = None,
+        receiptPrintForm: str = "Receipt48") -> dict:
         '''
         Level: Critical
         This function extracts required information from a receipt (with tax exclusive pricing)
@@ -1063,6 +1069,9 @@ class Device:
         else:
             raise ValueError("Library Error: Invalid receiptDate format. Must be a string or datetime object.")
 
+        # Set receiptPrintForm from the function parameter
+        prepared_receipt['receiptPrintForm'] = receiptPrintForm
+
         # Mark receipt as tax exclusive.
         prepared_receipt['receiptLinesTaxInclusive'] = False
 
@@ -1113,6 +1122,9 @@ class Device:
         # Insert device signature.
         reordered_receipt = insert_receiptDeviceSignature(receiptData=reordered_receipt)
         return reordered_receipt
+
+
+
 
     def submitReceipt(self, receiptData:dict)->dict:
         '''
