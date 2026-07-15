@@ -1,6 +1,6 @@
 # 🇿🇼 Zimra Python Client for ZIMRA FDMS
 
-A Python library for interacting with Zimbabwe Revenue Authority's **Fiscal Device Management System (FDMS)**. Handles device registration, receipt fiscalization, cryptographic signing, tax calculations, and fiscal day management — so you don't have to.
+A Python library for interacting with Zimbabwe Revenue Authority's **Fiscal Device Management System (FDMS)**. Handles device registration, receipt fiscalization, cryptographic signing, tax calculations, and fiscal day management, so you don't have to.
 
 ```bash
 pip install zimra
