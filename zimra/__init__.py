@@ -23,6 +23,45 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 logging.basicConfig(level=logging.INFO)
 
+# FDMS answers synchronous calls within 30 seconds (API spec v7.2, section 7.4).
+# Without a timeout, a stalled connection makes requests hang forever.
+REQUEST_TIMEOUT = 35
+
+
+def _post(*args, **kwargs):
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    return requests.post(*args, **kwargs)
+
+
+def _get(*args, **kwargs):
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    return requests.get(*args, **kwargs)
+
+
+# MoneyType enum, in enum order (API spec v7.2, section 5.4.5).
+MONEY_TYPES = ['Cash', 'Card', 'MobileWallet', 'Coupon', 'Credit', 'BankTransfer', 'Other']
+
+
+def _money_type_index(value):
+    """Accept the enum index (0, 1, ...) or name ('Cash', 'MobileWallet', ...); return the index or None."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value < len(MONEY_TYPES) else None
+    text = str(value).strip()
+    if text.isdigit():
+        return _money_type_index(int(text))
+    for i, name in enumerate(MONEY_TYPES):
+        if name.lower() == text.lower():
+            return i
+    return None
+
+
+def _money_type_name(value):
+    """Upper-case money type name as used in the fiscal day signature, e.g. 'MOBILEWALLET'."""
+    index = _money_type_index(value)
+    return MONEY_TYPES[index].upper() if index is not None else ''
+
 '''
 DISCLAIMER: THE FOLLOWING SOFTWARE IS DAUNTING AND VERY COMPLICATED. THIS FOLLOWS THE LAW COMPLEXITY ALWAYS INCREASES.
 EVEN IN OUR ATTEMPTS TO DECREASE IT, 
@@ -244,7 +283,7 @@ def register_new_device(
         'certificateRequest': csr_pem,
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = _post(url, json=payload, headers=headers)
 
     if response.status_code == 200:
         logging.info("Request was successful!")
@@ -310,10 +349,10 @@ class Device:
         logging.info(f"Library Info: Receipt Taxes: {receiptTaxes}")
         concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)  
         if previous_hash:
-            string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
+            string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
             logging.info(f"Library Info: string to sign: {string_to_sign}")
         else:
-            string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
+            string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
             logging.info(f"Library Info: string to sign: {string_to_sign}")
             
         hash_value = self.get_hash(string_to_sign)
@@ -460,7 +499,7 @@ class Device:
         }
         ''' 
         url = f'{self.deviceBaseUrl}/GetConfig'
-        response = requests.get(
+        response = _get(
             url,
             cert=(self.certPath, self.keyPath),
             headers = {
@@ -521,17 +560,18 @@ class Device:
 
 
         try:
-            response = requests.post(
+            response = _post(
                 url,
                 headers=headers, 
                 cert=(self.certPath, self.keyPath),
                 json=data,
             )
             response.raise_for_status() 
+            certificate = response.json()['certificate']
             # Save the certificate to a file
-            with open(f'{self.company_name}.crt', 'w') as cert_file:
-                cert_file.write(response['certificate'])
-            return response['certificate']
+            with open(f'{self.companyName}.crt', 'w') as cert_file:
+                cert_file.write(certificate)
+            return certificate
 
         except requests.exceptions.HTTPError as http_err:
             # Print detailed error message from the response
@@ -552,7 +592,7 @@ class Device:
 
         '''
         url = f'{self.deviceBaseUrl}/GetStatus'
-        response = requests.get(
+        response = _get(
             url,
             cert=(self.certPath, self.keyPath),
             headers = {
@@ -575,7 +615,7 @@ class Device:
             'DeviceModelVersion': self.deviceModelVersion,
             'accept': 'application/json',
         }
-        response = requests.post(
+        response = _post(
             url,
             cert=(self.certPath, self.keyPath),
             headers=headers
@@ -627,7 +667,7 @@ class Device:
         }
         
         try:
-            response = requests.post(
+            response = _post(
                 url, 
                 cert=(self.certPath, self.keyPath),
                 headers=headers, 
@@ -677,12 +717,16 @@ class Device:
                     # New 2026 standard rate
                     return self.applicableTaxes.get(15.5, 515)
                 elif tax_percent_val == 15:
-                    # Legacy 15% - check if we have it, otherwise use 15.5%
+                    # Legacy 15%. Only valid while FDMS still offers a 15% tax for this taxpayer.
+                    # Falling back to the 15.5% taxID would send taxPercent 15 with the 15.5% taxID,
+                    # which FDMS marks as a Red RCPT025 error and which blocks closing the fiscal day.
                     if 15 in self.applicableTaxes:
-                        return self.applicableTaxes.get(15, 3)
-                    else:
-                        # Fallback to 15.5% if 15% not available
-                        return self.applicableTaxes.get(15.5, 515)
+                        return self.applicableTaxes[15]
+                    raise ValueError(
+                        "Library Error: tax_percent 15 is not in applicableTaxes. "
+                        "The standard rate is 15.5% from 2026: update the line's tax_percent, "
+                        "or set applicableTaxes from getConfig()."
+                    )
                 else:
                     raise ValueError(f"Invalid tax_percent value: {line['tax_percent']}")
 
@@ -765,10 +809,10 @@ class Device:
             logging.info(f"Library Info: Receipt Taxes: {receiptTaxes}")
             concatenated_receipt_taxes = self.concatenate_receipt_taxes(receiptTaxes=receiptTaxes)  
             if previous_hash:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}{previous_hash}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
             else:
-                string_to_sign = f"{self.deviceID}{receiptData["receiptType"].upper()}{receiptData["receiptCurrency"].upper()}{receiptData["receiptGlobalNo"]}{receiptData["receiptDate"]}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
+                string_to_sign = f"{self.deviceID}{receiptData['receiptType'].upper()}{receiptData['receiptCurrency'].upper()}{receiptData['receiptGlobalNo']}{receiptData['receiptDate']}{int((Decimal(str(receiptData['receiptTotal'])) * Decimal('100')).quantize(Decimal('1')))}{concatenated_receipt_taxes}"
                 logging.info(f"Library Info: string to sign: {string_to_sign}")
                 
             hash_value = self.get_hash(string_to_sign)
@@ -905,12 +949,16 @@ class Device:
                 elif tax_percent_val == 5:
                     return applicableTaxes.get(5, 514)
                 elif tax_percent_val == 15:
-                    # Legacy 15% - check if we have it, otherwise use 15.5%
+                    # Legacy 15%. Only valid while FDMS still offers a 15% tax for this taxpayer.
+                    # Falling back to the 15.5% taxID would send taxPercent 15 with the 15.5% taxID,
+                    # which FDMS marks as a Red RCPT025 error and which blocks closing the fiscal day.
                     if 15 in self.applicableTaxes:
-                        return self.applicableTaxes.get(15, 3)
-                    else:
-                        # Fallback to 15.5% if 15% not available
-                        return self.applicableTaxes.get(15.5, 515)
+                        return self.applicableTaxes[15]
+                    raise ValueError(
+                        "Library Error: tax_percent 15 is not in applicableTaxes. "
+                        "The standard rate is 15.5% from 2026: update the line's tax_percent, "
+                        "or set applicableTaxes from getConfig()."
+                    )
                 elif tax_percent_val == 15.5:
                     # New 2026 standard rate
                     return applicableTaxes.get(15.5, 515)
@@ -1169,7 +1217,7 @@ class Device:
         logging.info(f"==== RECEIPT SENT\n\n{(json.dumps(payload, indent=4))}")
 
         
-        response = requests.post(
+        response = _post(
             url,
             cert=(self.certPath, self.keyPath),
             headers=headers,
@@ -1185,13 +1233,17 @@ class Device:
             return response_object
             
         
-    def generate_qr_code(self, signature: str, receipt_global_no, receipt_date=datetime.now().date()):
+    def generate_qr_code(self, signature: str, receipt_global_no, receipt_date=None):
         """
         Parameters:
         signature(str): receipt signature
         receipt_global_no(int): receipt global number
-        receipt_date = type(datetime.datetime.now().date())
+        receipt_date: date or datetime of the receipt (receiptDate). Pass it explicitly;
+            if omitted, today's date is used. (Previously the default was evaluated once,
+            when the module was imported, so a long-running process printed a stale date.)
         """
+        if receipt_date is None:
+            receipt_date = datetime.now().date()
         import base64
         import hashlib
 
@@ -1257,11 +1309,6 @@ class Device:
             string_to_implement = f'{self.deviceID}{fiscalDayNo}{fiscalDayDate}'
         
         def generate_string(device_id, fiscal_day_no, fiscal_day_date, fiscal_day_counters):
-            # Mapping for fiscalCounterMoneyType
-            money_type_mapping = {
-                0: "CASH",
-                1: "CARD"
-            }
             # Sort the fiscalDayCounters as per the rules
             sorted_counters = sorted(
                 fiscal_day_counters,
@@ -1277,8 +1324,9 @@ class Device:
                     # Sort alphabetically by fiscal counter currency
                     x['fiscalCounterCurrency'],
                     # Sort by fiscal counter tax ID (if present) or fiscal counter money type
-                    x.get('fiscalCounterTaxID', ''),
-                    x.get('fiscalCounterMoneyType', '')
+                    x.get('fiscalCounterTaxID') if x.get('fiscalCounterTaxID') is not None else -1,
+                    # Money types sort in enum order (Cash before Card), whether given as index or name
+                    _money_type_index(x.get('fiscalCounterMoneyType')) if _money_type_index(x.get('fiscalCounterMoneyType')) is not None else -1
                 )
             )
             # Concatenate the sorted fiscalDayCounters
@@ -1286,7 +1334,7 @@ class Device:
                 f"{counter['fiscalCounterType'].upper()}"
                 f"{counter['fiscalCounterCurrency'].upper()}"
                 f"{str(Decimal(counter['fiscalCounterTaxPercent']).quantize(Decimal('0.00'), rounding=ROUND_UP)) if counter.get('fiscalCounterTaxPercent') is not None else ''}"
-                f"{money_type_mapping.get(counter.get('fiscalCounterMoneyType'), '')}"  # Map money type to string
+                f"{_money_type_name(counter.get('fiscalCounterMoneyType'))}"  # e.g. CASH, CARD, MOBILEWALLET, BANKTRANSFER
                 f"{int((Decimal(counter['fiscalCounterValue']) * Decimal('100')).quantize(Decimal('1'), rounding=None))}"
                 for counter in sorted_counters
                 if Decimal(counter['fiscalCounterValue']) != Decimal('0')
@@ -1350,7 +1398,7 @@ class Device:
         
 
         try:
-            response = requests.post(
+            response = _post(
                 url, 
                 headers=headers,
                 cert=(self.certPath, self.keyPath),
